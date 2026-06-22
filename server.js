@@ -14,13 +14,9 @@ const io = new Server(server, {
 const COLORS = ['#a6e3a1', '#f38ba8', '#89b4fa', '#f9e2af', '#cba6f7', '#94e2d5'];
 const ADMIN_PASSWORD = "graph"; 
 
-// --- STATE MANAGEMENT ---
-// This allows an infinite number of private lobbies to run simultaneously
 const rooms = {}; 
-const socketMap = {}; // Maps a specific socket.id to their roomName
+const socketMap = {}; 
 
-// --- SECURITY PROTOCOLS ---
-// Strips dangerous characters to prevent HTML/XSS injection attacks
 function sanitiseText(str, maxLength = 20) {
     if (typeof str !== 'string') return 'Unknown';
     return str.replace(/[&<>"']/g, '').substring(0, maxLength).trim() || 'Player';
@@ -28,23 +24,33 @@ function sanitiseText(str, maxLength = 20) {
 
 function generateMap(roomName) {
     const obstacles = [];
-    for(let i = 0; i < 12; i++) {
-        obstacles.push({
+    let attempts = 0;
+    
+    // Generate up to 12 obstacles, but force them to spread out
+    while (obstacles.length < 12 && attempts < 500) {
+        let newObs = {
             x: Math.random() * 1400 + 100, 
             y: Math.random() * 700 + 100, 
             r: Math.random() * 60 + 40
-        });
+        };
+        
+        // Ensure at least a 30-pixel gap between the edges of every obstacle
+        let tooClose = obstacles.some(o => Math.hypot(newObs.x - o.x, newObs.y - o.y) < (newObs.r + o.r + 30));
+        
+        if (!tooClose) {
+            obstacles.push(newObs);
+        }
+        attempts++;
     }
 
     rooms[roomName].players.forEach((p, index) => {
-        // Late joiners are kept as dead spectators if the game is actively running
         if (rooms[roomName].inProgress && p.hp <= 0) return;
 
         p.hp = 100;
         let validSpawn = false;
-        let attempts = 0;
+        let pAttempts = 0;
         
-        while (!validSpawn && attempts < 100) {
+        while (!validSpawn && pAttempts < 100) {
             p.x = Math.random() * 1500 + 50;
             p.y = Math.random() * 800 + 50;
             
@@ -52,7 +58,7 @@ function generateMap(roomName) {
             let tooClose = rooms[roomName].players.slice(0, index).some(other => Math.hypot(p.x - other.x, p.y - other.y) < 400 && other.hp > 0);
 
             validSpawn = !inTree && !tooClose;
-            attempts++;
+            pAttempts++;
         }
     });
 
@@ -62,9 +68,7 @@ function generateMap(roomName) {
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // --- LOBBY SYSTEM ---
     socket.on('joinLobby', (data) => {
-        // Securely parse user inputs
         const rawRoom = data.roomName || 'Public';
         const roomName = sanitiseText(rawRoom, 20).toUpperCase();
         const playerName = sanitiseText(data.playerName, 15);
@@ -80,14 +84,12 @@ io.on('connection', (socket) => {
         
         const newPlayer = {
             id: socket.id,
-            hp: rooms[roomName].inProgress ? 0 : 100, // Spawn as spectator if game is running
+            hp: rooms[roomName].inProgress ? 0 : 100, 
             color: COLORS[rooms[roomName].connectionCount % COLORS.length],
             name: playerName
         };
         
         rooms[roomName].players.push(newPlayer);
-        
-        // Broadcast ONLY to players inside this specific room
         io.to(roomName).emit('lobbyUpdate', rooms[roomName].players);
         
         if (rooms[roomName].inProgress) {
@@ -114,11 +116,9 @@ io.on('connection', (socket) => {
         const roomName = socketMap[socket.id];
         if (!roomName) return;
 
-        // Security: Limit math strings to prevent massive memory overloads
         let safeMath = '';
         if (typeof data.funcStr === 'string') safeMath = data.funcStr.substring(0, 250);
 
-        // Security: Lock directions to exact predefined variables
         const allowedDirs = ['1', '-1', 'up', 'down'];
         const safeDir = allowedDirs.includes(data.dir) ? data.dir : '1';
 
@@ -143,7 +143,6 @@ io.on('connection', (socket) => {
             console.log(`User left room [${roomName}]: ${socket.id}`);
             rooms[roomName].players = rooms[roomName].players.filter(p => p.id !== socket.id);
             
-            // Clean up RAM by deleting the room if everyone leaves
             if (rooms[roomName].players.length === 0) {
                 delete rooms[roomName]; 
             } else {
