@@ -14,12 +14,20 @@ const io = new Server(server, {
 const COLORS = ['#a6e3a1', '#f38ba8', '#89b4fa', '#f9e2af', '#cba6f7', '#94e2d5'];
 const ADMIN_PASSWORD = "graph"; 
 
-let players = []; 
-let totalConnections = 0; 
+// --- STATE MANAGEMENT ---
+// This allows an infinite number of private lobbies to run simultaneously
+const rooms = {}; 
+const socketMap = {}; // Maps a specific socket.id to their roomName
 
-function generateMap() {
+// --- SECURITY PROTOCOLS ---
+// Strips dangerous characters to prevent HTML/XSS injection attacks
+function sanitiseText(str, maxLength = 20) {
+    if (typeof str !== 'string') return 'Unknown';
+    return str.replace(/[&<>"']/g, '').substring(0, maxLength).trim() || 'Player';
+}
+
+function generateMap(roomName) {
     const obstacles = [];
-    // 1600x900 map constraints
     for(let i = 0; i < 12; i++) {
         obstacles.push({
             x: Math.random() * 1400 + 100, 
@@ -28,20 +36,20 @@ function generateMap() {
         });
     }
 
-    players.forEach((p, index) => {
+    rooms[roomName].players.forEach((p, index) => {
+        // Late joiners are kept as dead spectators if the game is actively running
+        if (rooms[roomName].inProgress && p.hp <= 0) return;
+
         p.hp = 100;
         let validSpawn = false;
         let attempts = 0;
         
-        // Find a spawn point that is not in a tree AND not near another player
         while (!validSpawn && attempts < 100) {
             p.x = Math.random() * 1500 + 50;
             p.y = Math.random() * 800 + 50;
             
             let inTree = obstacles.some(o => Math.hypot(p.x - o.x, p.y - o.y) < o.r + 15);
-            
-            // Check distance against all players already processed in this loop
-            let tooClose = players.slice(0, index).some(other => Math.hypot(p.x - other.x, p.y - other.y) < 400);
+            let tooClose = rooms[roomName].players.slice(0, index).some(other => Math.hypot(p.x - other.x, p.y - other.y) < 400 && other.hp > 0);
 
             validSpawn = !inTree && !tooClose;
             attempts++;
@@ -53,39 +61,96 @@ function generateMap() {
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
-    totalConnections++;
 
-    const newPlayer = {
-        id: socket.id,
-        hp: 100,
-        color: COLORS[totalConnections % COLORS.length],
-        name: `Player ${totalConnections}`
-    };
-    players.push(newPlayer);
-    
-    io.emit('lobbyUpdate', players);
+    // --- LOBBY SYSTEM ---
+    socket.on('joinLobby', (data) => {
+        // Securely parse user inputs
+        const rawRoom = data.roomName || 'Public';
+        const roomName = sanitiseText(rawRoom, 20).toUpperCase();
+        const playerName = sanitiseText(data.playerName, 15);
+
+        socket.join(roomName);
+        socketMap[socket.id] = roomName;
+
+        if (!rooms[roomName]) {
+            rooms[roomName] = { players: [], obstacles: [], inProgress: false, connectionCount: 0 };
+        }
+
+        rooms[roomName].connectionCount++;
+        
+        const newPlayer = {
+            id: socket.id,
+            hp: rooms[roomName].inProgress ? 0 : 100, // Spawn as spectator if game is running
+            color: COLORS[rooms[roomName].connectionCount % COLORS.length],
+            name: playerName
+        };
+        
+        rooms[roomName].players.push(newPlayer);
+        
+        // Broadcast ONLY to players inside this specific room
+        io.to(roomName).emit('lobbyUpdate', rooms[roomName].players);
+        
+        if (rooms[roomName].inProgress) {
+            socket.emit('gameStarted', { 
+                players: rooms[roomName].players, 
+                obstacles: rooms[roomName].obstacles 
+            });
+        }
+    });
 
     socket.on('startGame', () => {
-        const obstacles = generateMap();
-        io.emit('gameStarted', { players: players, obstacles: obstacles });
+        const roomName = socketMap[socket.id];
+        if (!roomName || !rooms[roomName]) return;
+
+        rooms[roomName].inProgress = true;
+        rooms[roomName].obstacles = generateMap(roomName);
+        io.to(roomName).emit('gameStarted', { 
+            players: rooms[roomName].players, 
+            obstacles: rooms[roomName].obstacles 
+        });
     });
 
     socket.on('fireProjectile', (data) => {
-        data.playerId = socket.id;
-        io.emit('incomingShot', data);
+        const roomName = socketMap[socket.id];
+        if (!roomName) return;
+
+        // Security: Limit math strings to prevent massive memory overloads
+        let safeMath = '';
+        if (typeof data.funcStr === 'string') safeMath = data.funcStr.substring(0, 250);
+
+        // Security: Lock directions to exact predefined variables
+        const allowedDirs = ['1', '-1', 'up', 'down'];
+        const safeDir = allowedDirs.includes(data.dir) ? data.dir : '1';
+
+        io.to(roomName).emit('incomingShot', {
+            playerId: socket.id,
+            funcStr: safeMath,
+            dir: safeDir
+        });
     });
 
     socket.on('adminKick', (data) => {
-        if (data.password === ADMIN_PASSWORD) {
-            console.log(`Admin kicked player: ${data.targetId}`);
-            io.emit('playerKicked', data.targetId);
+        const roomName = socketMap[socket.id];
+        if (roomName && data.password === ADMIN_PASSWORD) {
+            const safeTarget = String(data.targetId);
+            io.to(roomName).emit('playerKicked', safeTarget);
         }
     });
 
     socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.id}`);
-        players = players.filter(p => p.id !== socket.id);
-        io.emit('lobbyUpdate', players);
+        const roomName = socketMap[socket.id];
+        if (roomName && rooms[roomName]) {
+            console.log(`User left room [${roomName}]: ${socket.id}`);
+            rooms[roomName].players = rooms[roomName].players.filter(p => p.id !== socket.id);
+            
+            // Clean up RAM by deleting the room if everyone leaves
+            if (rooms[roomName].players.length === 0) {
+                delete rooms[roomName]; 
+            } else {
+                io.to(roomName).emit('lobbyUpdate', rooms[roomName].players);
+            }
+        }
+        delete socketMap[socket.id];
     });
 });
 
