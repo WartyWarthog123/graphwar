@@ -11,51 +11,60 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Use a Map or structured object to track active socket roles cleanly
-let players = {}; 
+const COLORS = ['#a6e3a1', '#f38ba8', '#89b4fa', '#f9e2af', '#cba6f7', '#94e2d5'];
+let players = []; 
+
+function generateMap() {
+    const obstacles = [];
+    // Generate 25 random circular islands
+    for(let i = 0; i < 25; i++) {
+        obstacles.push({
+            x: Math.random() * 1100 + 50,
+            y: Math.random() * 500 + 150, 
+            r: Math.random() * 60 + 30
+        });
+    }
+
+    // Assign random spawn points to all connected players
+    players.forEach(p => {
+        p.hp = 100;
+        const obs = obstacles[Math.floor(Math.random() * obstacles.length)];
+        p.x = obs.x + (Math.random() * 40 - 20); // Randomly offset slightly from centre
+        p.y = obs.y - obs.r - 15; // Place on top of the circle
+    });
+
+    return obstacles;
+}
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Figure out which roles are currently vacant
-    const activeRoles = Object.values(players);
+    // Add new player to the lobby
+    const newPlayer = {
+        id: socket.id,
+        hp: 100,
+        color: COLORS[players.length % COLORS.length],
+        name: `Player ${players.length + 1}`
+    };
+    players.push(newPlayer);
     
-    if (!activeRoles.includes(1)) {
-        players[socket.id] = 1;
-        socket.emit('roleAssign', 1);
-        console.log(`Assigned ${socket.id} to Player 1`);
-    } else if (!activeRoles.includes(2)) {
-        players[socket.id] = 2;
-        socket.emit('roleAssign', 2);
-        console.log(`Assigned ${socket.id} to Player 2`);
-        
-        // Only trigger the game start when both distinct roles are filled
-        io.emit('gameReady', { message: "Both players connected. Player 1, take aim!" });
-    } else {
-        socket.emit('roleAssign', 0); // Spectator
-    }
+    // Sync the lobby list
+    io.emit('lobbyUpdate', players);
+
+    socket.on('startGame', () => {
+        const obstacles = generateMap();
+        io.emit('gameStarted', { players: players, obstacles: obstacles });
+    });
 
     socket.on('fireProjectile', (data) => {
-        // Protect turn integrity by ensuring the sender matches the current role assignment
-        io.emit('incomingShot', {
-            player: players[socket.id],
-            funcStr: data.funcStr
-        });
+        // Relay the math function and firing direction to all clients
+        io.emit('incomingShot', data);
     });
 
     socket.on('disconnect', () => {
-        const leavingRole = players[socket.id];
-        console.log(`User disconnected: ${socket.id} (Player ${leavingRole || 'Spectator'})`);
-        
-        // Remove the connection mapping
-        delete players[socket.id];
-
-        // Safely alert the remaining player if it was an active competitor who dropped out
-        if (leavingRole === 1 || leavingRole === 2) {
-            io.emit('playerDisconnected');
-            // Safely clear out the lobby data for a fresh matchmaking pool
-            players = {};
-        }
+        console.log(`User disconnected: ${socket.id}`);
+        players = players.filter(p => p.id !== socket.id);
+        io.emit('lobbyUpdate', players);
     });
 });
 
